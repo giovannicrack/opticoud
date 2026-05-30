@@ -1,5 +1,5 @@
 /**
- * OptiCoud Worker v5.3
+ * OptiCoud Worker v5.4
  * - Lee credenciales desde Supabase (settings table)
  * - Lee credenciales por proyecto desde projects table
  * - Escribe .env.local localmente si el proyecto tiene credenciales en DB
@@ -226,23 +226,45 @@ function ensureProjectClaudeMd(project, projectName, settings) {
   console.log(`[CLAUDE.MD] Creado (genérico) → ${mdPath}`)
 }
 
-async function buildPrompt(task, project, projectName, settings) {
-  const folderExists = project.folder_path && existsSync(project.folder_path)
-  const stored       = settings?.[`project_context_${project.id}`]
-  const history      = await fetchHistory(task.project_id)
-  const credsBlock   = buildCredsBlock(project)
+// Simple tasks: review/query/info — use haiku (5× cheaper). Complex: build/create/implement.
+function isSimpleTask(prompt) {
+  const lower = prompt.toLowerCase()
+  const complexWords = ['crea', 'construye', 'implementa', 'desarrolla', 'agrega', 'añade',
+    'instala', 'configura', 'migra', 'refactor', 'genera', 'hace', 'hacer', 'carga',
+    'inicializa', 'diseña', 'integra', 'build', 'create', 'implement', 'add', 'install']
+  const isComplex = complexWords.some(w => lower.includes(w)) || prompt.trim().split(/\s+/).length > 50
+  return !isComplex
+}
 
-  const parts = [EFFICIENCY_RULES, '']
+async function buildPrompt(task, project, projectName, settings) {
+  const folderExists  = project.folder_path && existsSync(project.folder_path)
+  const hasClaudeMd   = folderExists && existsSync(join(project.folder_path, 'CLAUDE.md'))
+  const envLocalExists = folderExists && existsSync(join(project.folder_path, '.env.local'))
+  const stored        = settings?.[`project_context_${project.id}`]
+  const hasContext    = !!stored
+
+  const parts = []
+
+  // Skip EFFICIENCY_RULES if CLAUDE.md already has them (avoids duplication)
+  if (!hasClaudeMd) parts.push(EFFICIENCY_RULES, '')
 
   if (stored && !folderExists) {
-    // Folder doesn't exist locally (Railway running remote project):
-    // inject full context into prompt since there's no CLAUDE.md available
+    // No local folder (Railway remote project) — inject context since no CLAUDE.md on disk
     parts.push('=== CONTEXTO DEL PROYECTO ===', stored, '=== FIN CONTEXTO ===', '')
   }
 
-  // Always include credentials (actual values not in context)
-  if (credsBlock) parts.push(credsBlock, '')
-  if (history)    parts.push(history, '')
+  // Skip credentials if .env.local already exists on disk — Claude reads it automatically
+  if (!envLocalExists) {
+    const credsBlock = buildCredsBlock(project)
+    if (credsBlock) parts.push(credsBlock, '')
+  }
+
+  // Skip history when full context exists — CLAUDE.md already gives structural continuity
+  if (!hasContext) {
+    const history = await fetchHistory(task.project_id)
+    if (history) parts.push(history, '')
+  }
+
   parts.push(`=== TAREA: ${projectName} ===`, task.prompt)
   return parts.join('\n')
 }
@@ -420,6 +442,7 @@ async function refreshProjectContext(project, projectName) {
   const context = lines.filter(l => l !== undefined).join('\n')
 
   await supabase.from('settings').upsert({ key: `project_context_${project.id}`, value: context })
+  settingsCachedAt = 0  // bust cache — next task must read fresh context immediately
   console.log(`[CONTEXT] ↺ "${projectName}" — ${allFiles.length} archivos, ${context.length} chars`)
 }
 
@@ -462,11 +485,16 @@ async function processNextTask() {
     const oauthToken   = env.CLAUDE_CODE_OAUTH_TOKEN
 
     const output = await new Promise((resolve, reject) => {
+      // Use Haiku for simple tasks (review/query) — 5× cheaper token usage
+      const model = isSimpleTask(task.prompt) ? 'claude-haiku-4-5-20251001' : null
+      if (model) console.log(`[MODEL] Tarea simple → ${model}`)
+
       const proc = spawn(CLAUDE_BIN, [
         '--dangerously-skip-permissions',
         '-p', fullPrompt,
         '--output-format', 'text',
         '--max-turns', String(MAX_TURNS),
+        ...(model ? ['--model', model] : []),
       ], {
         cwd: workDir,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -619,7 +647,7 @@ try {
 
 const settings = await getSettings()
 console.log('┌─────────────────────────────────────────────┐')
-console.log('│         OptiCoud Worker v5.3                │')
+console.log('│         OptiCoud Worker v5.4                │')
 console.log('└─────────────────────────────────────────────┘')
 console.log(`  Supabase:    ${env.NEXT_PUBLIC_SUPABASE_URL.replace('https://', '').split('.')[0]}`)
 console.log(`  Poll:        cada ${POLL_INTERVAL / 1000}s`)
