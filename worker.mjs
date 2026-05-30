@@ -1,5 +1,5 @@
 /**
- * OptiCoud Worker v5.0
+ * OptiCoud Worker v5.1
  * - Lee credenciales desde Supabase (settings table)
  * - Lee credenciales por proyecto desde projects table
  * - Escribe .env.local localmente si el proyecto tiene credenciales en DB
@@ -7,6 +7,8 @@
  * - Historial reducido: últimas 3 tareas, 300 chars por resultado (era 10 × 1500)
  * - --max-turns limita iteraciones de herramientas del CLI
  * - Reglas de eficiencia inyectadas en cada prompt (respuestas concisas)
+ * - Rate limit: detecta en stdout Y stderr, patterns expandidos, persiste en Supabase
+ * - Rate limit state sobrevive reinicios del worker (restaurado desde DB al arrancar)
  * - Auto-deploya a Vercel cuando se agotan las tareas pendientes
  */
 
@@ -87,11 +89,29 @@ function parseRateLimitReset(msg) {
 
 function isRateLimitError(msg) {
   const lower = msg.toLowerCase()
-  return lower.includes('rate limit') || lower.includes('usage limit') ||
-         lower.includes('too many requests') || lower.includes('429') ||
-         lower.includes('quota') || lower.includes('exceeded') ||
-         lower.includes('limit reached') || lower.includes('limit has been') ||
-         lower.includes('tokens per') || lower.includes('requests per')
+  return (
+    lower.includes('rate limit') ||
+    lower.includes('usage limit') ||
+    lower.includes('too many requests') ||
+    lower.includes('429') ||
+    lower.includes('quota') ||
+    lower.includes('limit reached') ||
+    lower.includes('limit has been') ||
+    lower.includes('tokens per') ||
+    lower.includes('requests per') ||
+    lower.includes('daily limit') ||
+    lower.includes('message limit') ||
+    lower.includes('you have reached') ||
+    lower.includes('you\'ve reached') ||
+    lower.includes('your limit') ||
+    lower.includes('plan limit') ||
+    lower.includes('out of tokens') ||
+    lower.includes('token budget') ||
+    lower.includes('credit balance') ||
+    lower.includes('claude.ai/upgrade') ||
+    lower.includes('upgrade your plan') ||
+    (lower.includes('try again') && (lower.includes('hour') || lower.includes('minute') || lower.includes('tomorrow')))
+  )
 }
 
 function uptimeStr() {
@@ -358,6 +378,13 @@ async function processNextTask() {
       proc.on('close', code => {
         clearTimeout(timer)
         if (killed) return
+        // Check BOTH streams for rate limit regardless of exit code
+        // (Claude CLI can exit 0 but print a limit message in stdout)
+        const combined = stderr + stdout
+        if (isRateLimitError(combined)) {
+          reject(Object.assign(new Error(combined.slice(0, 2000) || `exit ${code}`), { isRateLimit: true }))
+          return
+        }
         if (code === 0) resolve(truncate(stdout.trim()))
         else reject(new Error(stderr.slice(0, 4000) || stdout.slice(0, 4000) || `exit ${code}`))
       })
@@ -373,9 +400,11 @@ async function processNextTask() {
   } catch (err) {
     const msg = err.message || 'Error desconocido'
 
-    if (isRateLimitError(msg)) {
+    if (err.isRateLimit || isRateLimitError(msg)) {
       const resetAt = parseRateLimitReset(msg)
       rateLimitUntil = resetAt
+      // Persist to Supabase so it survives worker restarts
+      await supabase.from('settings').upsert({ key: 'rate_limit_until', value: String(resetAt) })
       const resetStr = new Date(resetAt).toLocaleTimeString('es-AR', { hour12: false })
       console.log(`[RATE LIMIT] Límite de tokens alcanzado. Retomando a las ${resetStr}`)
       await supabase.from('tasks').update({ status: 'pending' }).eq('id', task.id)
@@ -409,10 +438,11 @@ async function tick() {
       }
       return
     }
-    // Límite renovado
+    // Límite renovado — limpiar de memoria y de Supabase
     const resetStr = new Date(rateLimitUntil).toLocaleTimeString('es-AR', { hour12: false })
     console.log(`[RATE LIMIT] ✓ Tokens renovados (reset fue a las ${resetStr}), retomando…`)
     rateLimitUntil = null
+    await supabase.from('settings').delete().eq('key', 'rate_limit_until').catch(() => {})
   }
 
   running = true
@@ -444,9 +474,30 @@ try {
   }
 }
 
+// Restore rate limit state from Supabase (survives restarts)
+{
+  const { data: rl } = await supabase
+    .from('settings')
+    .select('value')
+    .eq('key', 'rate_limit_until')
+    .single()
+
+  if (rl?.value) {
+    const stored = parseInt(rl.value)
+    if (stored > Date.now()) {
+      rateLimitUntil = stored
+      const resetStr = new Date(stored).toLocaleTimeString('es-AR', { hour12: false })
+      console.log(`[RECOVERY] Rate limit activo hasta ${resetStr} (restaurado desde DB)`)
+    } else {
+      // Already expired — clean up
+      await supabase.from('settings').delete().eq('key', 'rate_limit_until').catch(() => {})
+    }
+  }
+}
+
 const settings = await getSettings()
 console.log('┌─────────────────────────────────────────────┐')
-console.log('│         OptiCoud Worker v5.0                │')
+console.log('│         OptiCoud Worker v5.1                │')
 console.log('└─────────────────────────────────────────────┘')
 console.log(`  Supabase:    ${env.NEXT_PUBLIC_SUPABASE_URL.replace('https://', '').split('.')[0]}`)
 console.log(`  Poll:        cada ${POLL_INTERVAL / 1000}s`)
