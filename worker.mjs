@@ -1,5 +1,5 @@
 /**
- * OptiCoud Worker v5.2
+ * OptiCoud Worker v5.3
  * - Lee credenciales desde Supabase (settings table)
  * - Lee credenciales por proyecto desde projects table
  * - Escribe .env.local localmente si el proyecto tiene credenciales en DB
@@ -11,12 +11,14 @@
  * - Rate limit state sobrevive reinicios del worker (restaurado desde DB al arrancar)
  * - Project context en Supabase settings (project_context_{id}): sincroniza CLAUDE.md
  *   en cada tarea → Claude no necesita explorar el proyecto desde cero
+ * - refreshProjectContext(): escanea carpeta del proyecto post-tarea y actualiza
+ *   el contexto en DB → contexto crece y se actualiza automáticamente con cada tarea
  * - Auto-deploya a Vercel cuando se agotan las tareas pendientes
  */
 
 import { spawn, execSync } from 'child_process'
 import { createClient } from '@supabase/supabase-js'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 
@@ -317,6 +319,110 @@ async function maybeAutoDeploy(project, projectName) {
   console.error(`[DEPLOY] Todas las cuentas Vercel agotadas`)
 }
 
+// Scan project folder after each completed task and update context in Supabase.
+// This means every subsequent task starts with an up-to-date map of the project.
+async function refreshProjectContext(project, projectName) {
+  if (!project?.id || !project.folder_path || !existsSync(project.folder_path)) return
+
+  const root = project.folder_path
+  const SKIP = new Set(['node_modules', '.git', '.next', 'dist', 'build', '.turbo', 'coverage', '.vercel', 'public', '.cache'])
+  const CODE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.sql', '.prisma', '.json'])
+
+  // Recursive walk — returns paths relative to root
+  function walk(dir, depth = 0) {
+    if (depth > 4) return []
+    let entries
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return [] }
+    const out = []
+    for (const e of entries) {
+      if (SKIP.has(e.name) || (e.name.startsWith('.') && e.name !== 'CLAUDE.md')) continue
+      const full = join(dir, e.name)
+      const rel  = full.slice(root.length + 1)
+      if (e.isDirectory()) {
+        out.push(...walk(full, depth + 1))
+      } else {
+        const ext = e.name.slice(e.name.lastIndexOf('.'))
+        if (CODE_EXTS.has(ext)) out.push(rel)
+      }
+    }
+    return out
+  }
+
+  const readSafe = (p, maxLen = 3000) => { try { return readFileSync(p, 'utf8').slice(0, maxLen) } catch { return null } }
+
+  const allFiles = walk(root)
+
+  // Categorize files
+  const pages      = allFiles.filter(f => /page\.(tsx?|jsx?)$/.test(f) || /layout\.(tsx?|jsx?)$/.test(f))
+  const apiRoutes  = allFiles.filter(f => f.includes('/api/') && /route\.(tsx?|jsx?)$/.test(f))
+  const components = allFiles.filter(f => /components?\//i.test(f))
+  const libFiles   = allFiles.filter(f => /\/(lib|utils|helpers|hooks|types|store)\//i.test(f))
+  const configs    = allFiles.filter(f => /^(next|tailwind|tsconfig|drizzle|prisma)/.test(f.split('/').pop()))
+  const scripts    = allFiles.filter(f => f.startsWith('scripts/') || f.endsWith('.sql') || f.endsWith('.prisma'))
+
+  // Stack from package.json
+  let stackLine = ''
+  const pkgRaw = readSafe(join(root, 'package.json'))
+  if (pkgRaw) {
+    try {
+      const pkg  = JSON.parse(pkgRaw)
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies }
+      const parts = []
+      if (deps.next)                       parts.push('Next.js ' + deps.next.replace(/[\^~]/, ''))
+      if (deps['@supabase/supabase-js'])   parts.push('Supabase')
+      if (deps.tailwindcss)                parts.push('Tailwind CSS')
+      if (deps.typescript)                 parts.push('TypeScript')
+      if (deps.prisma || deps['@prisma/client']) parts.push('Prisma')
+      if (deps['drizzle-orm'])             parts.push('Drizzle')
+      if (deps.express)                    parts.push('Express')
+      stackLine = parts.join(' + ') || (pkg.name || projectName)
+    } catch {}
+  }
+
+  // DB schema (first found)
+  let schema = null
+  for (const sp of ['scripts/setup.sql', 'schema.sql', 'supabase/schema.sql', 'prisma/schema.prisma']) {
+    schema = readSafe(join(root, sp), 2500)
+    if (schema) break
+  }
+
+  // Build context document
+  const section = (title, items) => items.length ? [`## ${title}`, ...items.map(f => '- ' + f), ''] : []
+
+  const lines = [
+    `# ${projectName}`,
+    project.description ? `\n${project.description}` : '',
+    '',
+    '## Stack',
+    stackLine || 'ver package.json',
+    '',
+    ...section('Páginas / Layouts', pages),
+    ...section('API Routes', apiRoutes),
+    ...section('Componentes', components),
+    ...section('Lib / Utils / Types', libFiles),
+    ...section('Config', configs),
+    ...section('Scripts / Schema', scripts),
+  ]
+
+  if (schema) lines.push('## Schema base de datos', '```', schema, '```', '')
+
+  lines.push(
+    '## Variables de entorno',
+    'Configuradas en .env.local — NO imprimir ni modificar.',
+    '',
+    '## Reglas para el agente',
+    '- CONCISO: máximo 10 líneas en la respuesta final',
+    '- Ejecutar directamente SIN pedir confirmaciones',
+    '- NO explorar el proyecto — usar este contexto como mapa',
+    '- Preferir editar archivos existentes sobre crear nuevos',
+  )
+
+  const context = lines.filter(l => l !== undefined).join('\n')
+
+  await supabase.from('settings').upsert({ key: `project_context_${project.id}`, value: context })
+  console.log(`[CONTEXT] ↺ "${projectName}" — ${allFiles.length} archivos, ${context.length} chars`)
+}
+
 async function processNextTask() {
   const { data: tasks, error } = await supabase
     .from('tasks')
@@ -407,6 +513,9 @@ async function processNextTask() {
     await supabase.from('tasks').update({ status: 'completed', result: output }).eq('id', task.id)
     processedToday++
     console.log(`[OK] Completado (${(output.match(/\n/g) || []).length + 1} líneas · ${processedToday} tareas hoy · uptime ${uptimeStr()})`)
+
+    // Refresh project context so the next task starts with an up-to-date map
+    if (project) await refreshProjectContext(project, projectName).catch(e => console.warn('[CONTEXT]', e.message))
 
     if (project) await maybeAutoDeploy(project, projectName)
 
@@ -510,7 +619,7 @@ try {
 
 const settings = await getSettings()
 console.log('┌─────────────────────────────────────────────┐')
-console.log('│         OptiCoud Worker v5.2                │')
+console.log('│         OptiCoud Worker v5.3                │')
 console.log('└─────────────────────────────────────────────┘')
 console.log(`  Supabase:    ${env.NEXT_PUBLIC_SUPABASE_URL.replace('https://', '').split('.')[0]}`)
 console.log(`  Poll:        cada ${POLL_INTERVAL / 1000}s`)
