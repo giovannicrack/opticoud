@@ -1,5 +1,5 @@
 /**
- * OptiCoud Worker v5.1
+ * OptiCoud Worker v5.2
  * - Lee credenciales desde Supabase (settings table)
  * - Lee credenciales por proyecto desde projects table
  * - Escribe .env.local localmente si el proyecto tiene credenciales en DB
@@ -9,6 +9,8 @@
  * - Reglas de eficiencia inyectadas en cada prompt (respuestas concisas)
  * - Rate limit: detecta en stdout Y stderr, patterns expandidos, persiste en Supabase
  * - Rate limit state sobrevive reinicios del worker (restaurado desde DB al arrancar)
+ * - Project context en Supabase settings (project_context_{id}): sincroniza CLAUDE.md
+ *   en cada tarea → Claude no necesita explorar el proyecto desde cero
  * - Auto-deploya a Vercel cuando se agotan las tareas pendientes
  */
 
@@ -188,44 +190,55 @@ const EFFICIENCY_RULES = `=== REGLAS DE EJECUCIÓN (leer primero) ===
 - Respuesta final: 3-10 líneas máximo con lo que hiciste
 === FIN REGLAS ===`
 
-function ensureProjectClaudeMd(project, projectName) {
+// Sync CLAUDE.md from stored context in Supabase.
+// Priority: stored context > existing file > generic fallback.
+function ensureProjectClaudeMd(project, projectName, settings) {
   if (!project.folder_path || !existsSync(project.folder_path)) return
-  const mdPath = join(project.folder_path, 'CLAUDE.md')
-  if (existsSync(mdPath)) return // respect existing CLAUDE.md
+  const mdPath    = join(project.folder_path, 'CLAUDE.md')
+  const stored    = settings[`project_context_${project.id}`]
 
-  const stack = project.description
-    ? `Stack: Next.js App Router + Supabase + Tailwind CSS\nDescripción: ${project.description}`
-    : 'Stack: Next.js App Router + Supabase + Tailwind CSS'
+  if (stored) {
+    // Always sync from DB so CLAUDE.md stays up to date
+    writeFileSync(mdPath, stored)
+    console.log(`[CLAUDE.MD] Sincronizado desde DB (${stored.length} chars) → ${mdPath}`)
+    return
+  }
 
+  if (existsSync(mdPath)) return // custom CLAUDE.md, leave it alone
+
+  // Generic fallback for projects with no stored context
   const content = [
     `# ${projectName}`,
-    '',
-    stack,
-    '',
-    '## Reglas para el agente',
-    '- Respuestas CONCISAS: solo cambios realizados y errores relevantes (3-10 líneas)',
+    project.description ? `\n${project.description}` : '',
+    '\n## Reglas para el agente',
+    '- Respuestas CONCISAS: 5-10 líneas máximo',
     '- Ejecutar directamente SIN pedir confirmaciones',
-    '- NO explicar pasos intermedios ni herramientas usadas',
+    '- NO explorar archivos innecesarios — usá el contexto disponible',
     '- Prefiere editar archivos existentes, no crear nuevos',
-    '- Usa mínimas herramientas para completar la tarea',
-    '',
-    '## Convenciones del proyecto',
-    '- API routes en src/app/api/',
-    '- Componentes server-side por defecto (`use client` solo si necesario)',
+    '\n## Stack',
+    '- Next.js App Router + Supabase + Tailwind CSS',
     '- Variables de entorno en .env.local (ya configuradas)',
-    '- Supabase client vía @supabase/supabase-js',
-    '',
   ].join('\n')
 
   writeFileSync(mdPath, content)
-  console.log(`[CLAUDE.MD] Creado → ${mdPath}`)
+  console.log(`[CLAUDE.MD] Creado (genérico) → ${mdPath}`)
 }
 
-async function buildPrompt(task, project, projectName) {
-  const history    = await fetchHistory(task.project_id)
-  const credsBlock = buildCredsBlock(project)
+async function buildPrompt(task, project, projectName, settings) {
+  const folderExists = project.folder_path && existsSync(project.folder_path)
+  const stored       = settings?.[`project_context_${project.id}`]
+  const history      = await fetchHistory(task.project_id)
+  const credsBlock   = buildCredsBlock(project)
 
   const parts = [EFFICIENCY_RULES, '']
+
+  if (stored && !folderExists) {
+    // Folder doesn't exist locally (Railway running remote project):
+    // inject full context into prompt since there's no CLAUDE.md available
+    parts.push('=== CONTEXTO DEL PROYECTO ===', stored, '=== FIN CONTEXTO ===', '')
+  }
+
+  // Always include credentials (actual values not in context)
   if (credsBlock) parts.push(credsBlock, '')
   if (history)    parts.push(history, '')
   parts.push(`=== TAREA: ${projectName} ===`, task.prompt)
@@ -330,14 +343,14 @@ async function processNextTask() {
 
   const settings = await getSettings()
 
-  // Write .env.local and CLAUDE.md if they don't exist yet
+  // Write .env.local and sync CLAUDE.md from stored context
   if (project) {
     ensureEnvLocal(project, settings)
-    ensureProjectClaudeMd(project, projectName)
+    ensureProjectClaudeMd(project, projectName, settings)
   }
 
   try {
-    const fullPrompt = await buildPrompt(task, project || {}, projectName)
+    const fullPrompt = await buildPrompt(task, project || {}, projectName, settings)
     const anthropicKey = settings.anthropic_api_key || env.ANTHROPIC_API_KEY
     // CLAUDE_CODE_OAUTH_TOKEN usa el plan Pro de claude.ai (sin créditos de API)
     const oauthToken   = env.CLAUDE_CODE_OAUTH_TOKEN
@@ -497,7 +510,7 @@ try {
 
 const settings = await getSettings()
 console.log('┌─────────────────────────────────────────────┐')
-console.log('│         OptiCoud Worker v5.1                │')
+console.log('│         OptiCoud Worker v5.2                │')
 console.log('└─────────────────────────────────────────────┘')
 console.log(`  Supabase:    ${env.NEXT_PUBLIC_SUPABASE_URL.replace('https://', '').split('.')[0]}`)
 console.log(`  Poll:        cada ${POLL_INTERVAL / 1000}s`)
