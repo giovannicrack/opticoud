@@ -1,9 +1,12 @@
 /**
- * OptiCoud Worker v4.0
+ * OptiCoud Worker v5.0
  * - Lee credenciales desde Supabase (settings table)
  * - Lee credenciales por proyecto desde projects table
  * - Escribe .env.local localmente si el proyecto tiene credenciales en DB
- * - Inyecta historial + credenciales en cada prompt
+ * - Auto-crea CLAUDE.md en carpetas de proyecto (contexto persistente, sin inyección)
+ * - Historial reducido: últimas 3 tareas, 300 chars por resultado (era 10 × 1500)
+ * - --max-turns limita iteraciones de herramientas del CLI
+ * - Reglas de eficiencia inyectadas en cada prompt (respuestas concisas)
  * - Auto-deploya a Vercel cuando se agotan las tareas pendientes
  */
 
@@ -46,7 +49,8 @@ const supabase = createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE
 const POLL_INTERVAL   = 5000
 const TASK_TIMEOUT_MS = 45 * 60 * 1000
 const MAX_RESULT_SIZE = 8 * 1024 * 1024
-const HISTORY_LIMIT   = 10
+const HISTORY_LIMIT   = 3    // was 10 — reduces prompt tokens by ~70%
+const MAX_TURNS       = 30   // limit claude tool-call iterations
 
 let running = false
 let processedToday = 0
@@ -113,12 +117,13 @@ async function fetchHistory(projectId) {
   if (error || !data?.length) return ''
 
   return [
-    '=== HISTORIAL DE TAREAS ANTERIORES (para contexto) ===',
+    '=== HISTORIAL DE TAREAS ANTERIORES (últimas 3, solo contexto) ===',
     ...data.map((t, i) => {
       const date = new Date(t.created_at).toLocaleString('es-AR', { hour12: false })
-      return `### Tarea ${i + 1} (${date})\nInstrucción: ${t.prompt}\nResultado: ${(t.result || '').slice(0, 1500)}`
+      const resultSnippet = (t.result || '').replace(/\n+/g, ' ').trim().slice(0, 300)
+      return `[${date}] ${t.prompt.slice(0, 120)}${resultSnippet ? `\n→ ${resultSnippet}` : ''}`
     }),
-    '=== FIN DEL HISTORIAL ===',
+    '=== FIN HISTORIAL ===',
   ].join('\n')
 }
 
@@ -154,14 +159,56 @@ function ensureEnvLocal(project, settings) {
   }
 }
 
+const EFFICIENCY_RULES = `=== REGLAS DE EJECUCIÓN (leer primero) ===
+- Sé CONCISO: solo reporta cambios realizados y errores relevantes
+- NO expliques cada herramienta o paso intermedio
+- Ejecuta directamente SIN pedir confirmaciones
+- Prefiere editar archivos existentes sobre crear nuevos
+- Usa el mínimo de herramientas necesarias para completar la tarea
+- Respuesta final: 3-10 líneas máximo con lo que hiciste
+=== FIN REGLAS ===`
+
+function ensureProjectClaudeMd(project, projectName) {
+  if (!project.folder_path || !existsSync(project.folder_path)) return
+  const mdPath = join(project.folder_path, 'CLAUDE.md')
+  if (existsSync(mdPath)) return // respect existing CLAUDE.md
+
+  const stack = project.description
+    ? `Stack: Next.js App Router + Supabase + Tailwind CSS\nDescripción: ${project.description}`
+    : 'Stack: Next.js App Router + Supabase + Tailwind CSS'
+
+  const content = [
+    `# ${projectName}`,
+    '',
+    stack,
+    '',
+    '## Reglas para el agente',
+    '- Respuestas CONCISAS: solo cambios realizados y errores relevantes (3-10 líneas)',
+    '- Ejecutar directamente SIN pedir confirmaciones',
+    '- NO explicar pasos intermedios ni herramientas usadas',
+    '- Prefiere editar archivos existentes, no crear nuevos',
+    '- Usa mínimas herramientas para completar la tarea',
+    '',
+    '## Convenciones del proyecto',
+    '- API routes en src/app/api/',
+    '- Componentes server-side por defecto (`use client` solo si necesario)',
+    '- Variables de entorno en .env.local (ya configuradas)',
+    '- Supabase client vía @supabase/supabase-js',
+    '',
+  ].join('\n')
+
+  writeFileSync(mdPath, content)
+  console.log(`[CLAUDE.MD] Creado → ${mdPath}`)
+}
+
 async function buildPrompt(task, project, projectName) {
-  const history   = await fetchHistory(task.project_id)
+  const history    = await fetchHistory(task.project_id)
   const credsBlock = buildCredsBlock(project)
 
-  const parts = []
+  const parts = [EFFICIENCY_RULES, '']
   if (credsBlock) parts.push(credsBlock, '')
   if (history)    parts.push(history, '')
-  parts.push(`=== TAREA ACTUAL DEL PROYECTO "${projectName}" ===`, task.prompt)
+  parts.push(`=== TAREA: ${projectName} ===`, task.prompt)
   return parts.join('\n')
 }
 
@@ -263,8 +310,11 @@ async function processNextTask() {
 
   const settings = await getSettings()
 
-  // Write .env.local if project has DB credentials but file doesn't exist yet
-  if (project) ensureEnvLocal(project, settings)
+  // Write .env.local and CLAUDE.md if they don't exist yet
+  if (project) {
+    ensureEnvLocal(project, settings)
+    ensureProjectClaudeMd(project, projectName)
+  }
 
   try {
     const fullPrompt = await buildPrompt(task, project || {}, projectName)
@@ -277,6 +327,7 @@ async function processNextTask() {
         '--dangerously-skip-permissions',
         '-p', fullPrompt,
         '--output-format', 'text',
+        '--max-turns', String(MAX_TURNS),
       ], {
         cwd: workDir,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -395,12 +446,13 @@ try {
 
 const settings = await getSettings()
 console.log('┌─────────────────────────────────────────────┐')
-console.log('│         OptiCoud Worker v4.1                │')
+console.log('│         OptiCoud Worker v5.0                │')
 console.log('└─────────────────────────────────────────────┘')
 console.log(`  Supabase:    ${env.NEXT_PUBLIC_SUPABASE_URL.replace('https://', '').split('.')[0]}`)
 console.log(`  Poll:        cada ${POLL_INTERVAL / 1000}s`)
 console.log(`  Timeout:     ${TASK_TIMEOUT_MS / 60000} min por tarea`)
-console.log(`  Historial:   últimas ${HISTORY_LIMIT} tareas`)
+console.log(`  Historial:   últimas ${HISTORY_LIMIT} tareas (300 chars c/u)`)
+console.log(`  Max turns:   ${MAX_TURNS} por tarea`)
 console.log(`  Anthropic:   ${settings.anthropic_api_key ? '✓ API key' : '✓ CLI session (claude.ai)'}`)
 console.log(`  Vercel:      ${settings.vercel_token ? '✓ configurado' : '✗ sin token'}`)
 console.log('  Ctrl+C para detener\n')
